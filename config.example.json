@@ -1,0 +1,26 @@
+{
+  "icloud": {
+    "url": "https://caldav.icloud.com/",
+    "username": "your-apple-id@icloud.com",
+    "password": "your-app-specific-password"
+  },
+  "google": {
+    "client_id": "your-gcp-project.apps.googleusercontent.com",
+    "client_secret": "GOCSPX-your-client-secret",
+    "token_file": "/home/youruser/.bob/gcal-token.json"
+  },
+  "gemini": {
+    "api_key": "your-gemini-api-key"
+  },
+  "google_maps": {
+    "api_key": "your-google-maps-api-key"
+  },
+  "telegram": {
+    "bot_token": "your-telegram-bot-token",
+    "chat_id": "your-telegram-user-id"
+  },
+  "pico": {
+    "dashboard_token": "your-dashboard-token",
+    "pico_token": "your-pico-token"
+  }
+}
