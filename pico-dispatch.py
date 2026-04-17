@@ -9,8 +9,8 @@ import sys
 import json
 import asyncio
 import aiohttp
-
 import os
+
 _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 with open(_cfg_path) as _f:
     _cfg = json.load(_f)
@@ -29,7 +29,7 @@ async def dispatch(message):
         ) as r:
             cookie = r.cookies.get("picoclaw_launcher_auth")
             if not cookie:
-                print(message)  # fallback: return input as-is
+                print("[auth failed]")
                 return
 
     # Connect and send
@@ -46,17 +46,30 @@ async def dispatch(message):
                     "timestamp": int(asyncio.get_event_loop().time() * 1000)
                 })
 
-                async with asyncio.timeout(60):
+                async with asyncio.timeout(120):
                     async for m in ws:
                         if m.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(m.data)
-                            t = data.get("type", "")
+                            msg_type = data.get("type", "")
                             content = data.get("payload", {}).get("content", "")
-                            if t == "message.create" and content:
-                                print(content)
-                                return
+
+                            # Skip non-message events (typing indicators, etc.)
+                            if msg_type != "message.create":
+                                continue
+
+                            # Skip echo: if content matches what we sent, it's an ack
+                            if content and content.strip() == message.strip():
+                                continue
+
+                            # Skip empty content
+                            if not content:
+                                continue
+
+                            # This is the real worker response
+                            print(content)
+                            return
         except asyncio.TimeoutError:
-            print("[Pico dispatch timeout]")
+            print("[Pico dispatch timeout after 120s]")
         except Exception as e:
             print(f"[Pico error: {e}]")
 

@@ -50,10 +50,15 @@ async def dispatch_one(cookie, task, timeout_s=60):
                     async for m in ws:
                         if m.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(m.data)
-                            if data.get("type") == "message.create":
-                                content = data.get("payload", {}).get("content", "")
-                                if content:
-                                    return content
+                            if data.get("type") != "message.create":
+                                continue
+                            content = data.get("payload", {}).get("content", "")
+                            if not content:
+                                continue
+                            # Skip echo of sent message
+                            if content.strip() == task.strip():
+                                continue
+                            return content
         except asyncio.TimeoutError:
             return "[timeout]"
         except Exception as e:
