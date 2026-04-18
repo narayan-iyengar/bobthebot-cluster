@@ -22,7 +22,7 @@ with open(_cfg_path) as _f:
 
 GEMINI_API_KEY = _cfg["gemini"]["api_key"]
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-LOCAL_URL = "http://192.168.0.105:8080/v1/chat/completions"
+LOCAL_URL = "http://192.168.0.105:8080/v1/chat/completions"  # Phi-4 Mini 3.8B distributed
 
 REVIEW_PROMPT = "Review this output for accuracy. Reply APPROVED if correct, or REVISED with the correction. Be concise, one line.\n\nTask: {task}\nOutput: {output}"
 
@@ -52,14 +52,14 @@ def check_dates(text):
 def review_via_local(task, output):
     """Local LLM on cluster-llm for fast pre-filter."""
     body = json.dumps({
-        "model": "Llama-3.2-1B-Instruct",
+        "model": "Phi-4-mini-instruct",
         "messages": [{"role": "user", "content": REVIEW_PROMPT.format(task=task, output=output)}],
         "max_tokens": 50,
         "temperature": 0.1
     }).encode()
     req = urllib.request.Request(LOCAL_URL, data=body, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             d = json.loads(resp.read())
             result = d["choices"][0]["message"]["content"].strip()
             # Only trust APPROVED from local model. If it says REVISED,
