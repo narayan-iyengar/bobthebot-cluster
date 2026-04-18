@@ -1,5 +1,7 @@
 config.json
+bob.py
+bob.db
+bob-agent.md
 *.pyc
 __pycache__/
 .claude/
-bob-agent.md
