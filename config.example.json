@@ -19,8 +19,11 @@
     "bot_token": "your-telegram-bot-token",
     "chat_id": "your-telegram-user-id"
   },
-  "pico": {
-    "dashboard_token": "your-dashboard-token",
-    "pico_token": "your-pico-token"
-  }
+  "gemini_proxy": "http://controller-ip:8787",
+  "workers": [
+    "http://worker1-ip:5000",
+    "http://worker2-ip:5000",
+    "http://worker3-ip:5000",
+    "http://worker4-ip:5000"
+  ]
 }

@@ -17,7 +17,14 @@ import uuid
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, MessageHandler, CallbackQueryHandler, filters
+from telegram.ext import Application, MessageHandler, CallbackQueryHandler, TypeHandler, filters
+
+async def error_handler(update, context):
+    """Log errors and keep running."""
+    log.error(f"Update {update} caused error: {context.error}")
+
+# Track user locations: {chat_id: {"lat": ..., "lon": ..., "time": ...}}
+USER_LOCATIONS = {}
 
 # --- Config ---
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,26 +36,27 @@ GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.
 BOT_TOKEN = CFG["telegram"]["bot_token"]
 ALLOWED_USERS = [int(uid) for uid in CFG["telegram"].get("allow_from", [CFG["telegram"]["chat_id"]])]
 DB_PATH = os.path.join(DIR, "bob.db")
-TOOL_DIR = os.path.expanduser("~/.picoclaw/workspace")  # tools deployed here
+TOOL_DIR = DIR  # tools are in same directory as bob.py
+WORKERS = CFG.get("workers", [])
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bob")
 
 # --- System Prompt ---
-SYSTEM_PROMPT = """You are Bob, a personal home assistant for the your family.
-You are located at home in YOUR_CITY, STATE. Your timezone is YOUR_TIMEZONE (Pacific Time).
+SYSTEM_PROMPT = """You are Bob, a personal home assistant for the Iyengar family.
+You are located at home in Dublin, CA (Bay Area). Your timezone is America/Los_Angeles (Pacific Time).
 
 ## Tools
 You have tools for calendar, email, weather, traffic, web search, and worker dispatch.
 Use the right tool for each request. For simple questions, respond directly without tools.
 
 ## Family Members
-- Parent1: customize with your family
-- Parent2: customize
-- Child1: customize
-- Child2: customize
-# Add non-family members here
-# Add disambiguation notes for your family
+- Narayan: Dad. Personal calendar has work meetings.
+- Maighna: Mom (wife), also the boss. Events: "Maighna truffle group", dance, MUSE rehearsal, talent show.
+- Sahil: Son, age 9 (born 11/1/2016). Basketball: Lava, Elements AAU. Trains with Stevie (ClubSport) and Coach Lopez (Wallis Ranch). Drums at School of Rock.
+- Syon: Son, age 11 (born 10/13/2014). School of Rock: vocals, keys, band, MUSE. Royal Theater Academy (RTA): theater/acting.
+- Jay: Personal trainer, NOT family. "Jay personal training" is a training session.
+- NOTE: drums = Sahil. Keys/vocals/band = Syon. If event just says "SoR", check context.
 
 ## Calendars
 - Family (iCloud, default for writes), Home (iCloud), Personal (Google, read-only), Elements (sports/AAU, read-only)
@@ -56,12 +64,12 @@ Use the right tool for each request. For simple questions, respond directly with
 - When user asks for schedule without a date, show TODAY.
 
 ## Known Locations (verified, do not override with web search)
-- RTA (Royal Theater Academy): YOUR_LOCATION_ADDRESS
-- School of Rock (SoR): YOUR_LOCATION_ADDRESS
-- Stager Gym: YOUR_LOCATION_ADDRESS
-- ClubSport (Coach Stevie): YOUR_LOCATION_ADDRESS
-- Wallis Ranch (Coach Lopez): YOUR_LOCATION_ADDRESS
-- St. Elizabeth Ann Seton Church (Lava/Elements): YOUR_LOCATION_ADDRESS
+- RTA (Royal Theater Academy): 7066 Village Pkwy, Dublin, CA 94568
+- School of Rock (SoR): 460 Montgomery St, San Ramon, CA 94583
+- Stager Gym: Stager Community Gymnasium, Dublin, CA
+- ClubSport (Coach Stevie): 350 Bollinger Canyon Ln Ste A, San Ramon, CA 94582
+- Wallis Ranch (Coach Lopez): 6501 Rutherford Dr, Dublin, CA 94568
+- St. Elizabeth Ann Seton Church (Lava/Elements): 4001 Stoneridge Dr, Pleasanton, CA 94588
 
 ## Rules
 - NEVER hallucinate locations, times, or facts. Use tools.
@@ -105,10 +113,10 @@ TOOLS = {"function_declarations": [
      "parameters": {"type": "object", "properties": {
          "mode": {"type": "string", "enum": ["current", "forecast", "hourly"],
                   "description": "Weather mode. Default: current"}}}},
-    {"name": "traffic", "description": "Get real-time drive time with traffic to a destination from Dublin CA",
+    {"name": "traffic", "description": "Get real-time drive time with traffic to a destination. Origin defaults to home address.",
      "parameters": {"type": "object", "properties": {
          "destination": {"type": "string", "description": "Destination address or place name"},
-         "origin": {"type": "string", "description": "Origin address. Default: Dublin, CA"}},
+         "origin": {"type": "string", "description": "Origin address. Default: home"}},
       "required": ["destination"]}},
     {"name": "place_lookup", "description": "Look up the address of a place by name via Google Places",
      "parameters": {"type": "object", "properties": {
@@ -193,31 +201,40 @@ def execute_tool(name, args):
         return run_tool(f"python3 weather-tool.py {flag}")
     elif name == "traffic":
         dest = shq(resolve_location(args["destination"]))
-        origin = shq(resolve_location(args.get("origin", "Dublin, CA")))
+        # Use shared location if available and recent (within 2 hours)
+        origin_arg = args.get("origin", "")
+        if not origin_arg:
+            loc = _get_current_location()
+            if loc:
+                origin = shq(f"{loc['lat']},{loc['lon']}")
+            else:
+                origin = shq(resolve_location("home"))
+        else:
+            origin = shq(resolve_location(origin_arg))
         return run_tool(f"python3 traffic-tool.py {origin} {dest}")
     elif name == "place_lookup":
         return run_tool(f"python3 traffic-tool.py lookup {shq(args['query'])}")
     elif name == "web_search":
         return duckduckgo_search(args["query"])
     elif name == "dispatch_worker":
-        return run_tool(f"python3 pico-dispatch.py {shq(args['task'])}", timeout=120)
+        return dispatch_to_worker(args["task"])
     else:
         return f"Unknown tool: {name}"
 
 KNOWN_LOCATIONS = {
-    "rta": "YOUR_LOCATION_ADDRESS
-    "royal theater academy": "YOUR_LOCATION_ADDRESS
-    "sor": "YOUR_LOCATION_ADDRESS
-    "school of rock": "YOUR_LOCATION_ADDRESS
-    "stager gym": "YOUR_LOCATION_ADDRESS
-    "stager": "YOUR_LOCATION_ADDRESS
-    "clubsport": "YOUR_LOCATION_ADDRESS
-    "coach stevie": "YOUR_LOCATION_ADDRESS
-    "wallis ranch": "YOUR_LOCATION_ADDRESS
-    "coach lopez": "YOUR_LOCATION_ADDRESS
-    "st elizabeth": "YOUR_LOCATION_ADDRESS
-    "seton church": "YOUR_LOCATION_ADDRESS
-    "home": "YOUR_HOME_ADDRESS",
+    "rta": "7066 Village Pkwy, Dublin, CA 94568",
+    "royal theater academy": "7066 Village Pkwy, Dublin, CA 94568",
+    "sor": "460 Montgomery St, San Ramon, CA 94583",
+    "school of rock": "460 Montgomery St, San Ramon, CA 94583",
+    "stager gym": "Stager Community Gymnasium, Dublin, CA",
+    "stager": "Stager Community Gymnasium, Dublin, CA",
+    "clubsport": "350 Bollinger Canyon Ln Ste A, San Ramon, CA 94582",
+    "coach stevie": "350 Bollinger Canyon Ln Ste A, San Ramon, CA 94582",
+    "wallis ranch": "6501 Rutherford Dr, Dublin, CA 94568",
+    "coach lopez": "6501 Rutherford Dr, Dublin, CA 94568",
+    "st elizabeth": "4001 Stoneridge Dr, Pleasanton, CA 94588",
+    "seton church": "4001 Stoneridge Dr, Pleasanton, CA 94588",
+    "home": "your-home-address",
 }
 
 def resolve_location(name):
@@ -228,6 +245,53 @@ def resolve_location(name):
 def shq(s):
     """Shell quote a string."""
     return "'" + s.replace("'", "'\\''") + "'"
+
+def dispatch_to_worker(task, timeout=120):
+    """Dispatch a task to a healthy worker via HTTP."""
+    for worker_url in WORKERS:
+        try:
+            # Health check
+            req = urllib.request.Request(f"{worker_url}/health")
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            continue  # skip dead worker
+
+        # Dispatch task
+        try:
+            body = json.dumps({"task": task}).encode()
+            req = urllib.request.Request(
+                f"{worker_url}/task", data=body,
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read())
+                worker = data.get("worker", "unknown")
+                log.info(f"Worker {worker} completed task")
+                return data.get("result", "[no result]")
+        except Exception as e:
+            log.warning(f"Worker {worker_url} failed: {e}")
+            continue
+
+    # All workers failed, fall back to Gemini directly
+    log.warning("All workers unavailable, using Gemini directly")
+    return call_gemini_direct(task)
+
+
+def call_gemini_direct(task):
+    """Fall back: call Gemini directly for a task (no worker)."""
+    body = json.dumps({
+        "contents": [{"role": "user", "parts": [{"text": task}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048}
+    }).encode()
+    req = urllib.request.Request(GEMINI_URL, data=body,
+                                headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        return f"Error: {e}"
+
 
 def duckduckgo_search(query, max_results=5):
     """Search DuckDuckGo and return results."""
@@ -384,6 +448,33 @@ async def handle_message(update: Update, context):
     save_message(db, chat_id, "user", user_msg)
     save_message(db, chat_id, "model", text)
 
+def _get_current_location(max_age_hours=2):
+    """Get most recent shared location if within max_age_hours."""
+    for chat_id, loc in USER_LOCATIONS.items():
+        age = (datetime.now() - loc["time"]).total_seconds() / 3600
+        if age < max_age_hours:
+            return loc
+    return None
+
+async def handle_location(update: Update, context):
+    """Handle shared location from Telegram (initial or live updates)."""
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
+    # Location can come from message or edited_message (live location updates)
+    msg = update.message or update.edited_message
+    if not msg or not msg.location:
+        return
+    loc = msg.location
+    chat_id = update.effective_chat.id
+    is_update = chat_id in USER_LOCATIONS
+    USER_LOCATIONS[chat_id] = {
+        "lat": loc.latitude, "lon": loc.longitude, "time": datetime.now()
+    }
+    log.info(f"Location {'updated' if is_update else 'received'}: {loc.latitude},{loc.longitude}")
+    if not is_update:
+        await msg.reply_text(
+            "Got your location. Traffic queries will use this as origin for the next 2 hours.")
+
 async def handle_callback(update: Update, context):
     """Handle approve/reject button taps."""
     query = update.callback_query
@@ -424,6 +515,9 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    # Catch-all: silently absorb any unhandled update (edited_message, location, etc.)
+    app.add_handler(TypeHandler(Update, lambda u, c: None))
+    app.add_error_handler(error_handler)
 
     log.info("Bob v2 running. Waiting for messages...")
     app.run_polling(drop_pending_updates=True)
