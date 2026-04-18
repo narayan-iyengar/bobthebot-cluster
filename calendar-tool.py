@@ -244,15 +244,15 @@ def add_event(title, start_str, end_str=None, calendar_name=None, location=None)
             title = parts[0].strip()
             location = parts[1].strip()
 
-    # Build VCALENDAR
+    # Build VCALENDAR with timezone
     loc_line = f"\nLOCATION:{location}" if location else ""
     vcal = (
         "BEGIN:VCALENDAR\n"
         "VERSION:2.0\n"
         "PRODID:-//Bob//ClusterHAT//EN\n"
         "BEGIN:VEVENT\n"
-        f"DTSTART:{start.strftime('%Y%m%dT%H%M%S')}\n"
-        f"DTEND:{end_dt.strftime('%Y%m%dT%H%M%S')}\n"
+        f"DTSTART;TZID=America/Los_Angeles:{start.strftime('%Y%m%dT%H%M%S')}\n"
+        f"DTEND;TZID=America/Los_Angeles:{end_dt.strftime('%Y%m%dT%H%M%S')}\n"
         f"SUMMARY:{title}{loc_line}\n"
         "END:VEVENT\n"
         "END:VCALENDAR"
