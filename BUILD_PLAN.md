@@ -73,15 +73,19 @@ originSessionId: c012232c-a22f-41df-adda-157f1d6e9059
 - Backup config.json and bob.db
 
 ## Current Status
-- Step 1: NOT STARTED
-- Step 2: NOT STARTED (bob.py exists but uses pico-dispatch)
-- Step 3: NOT STARTED (PicoClaw still running for dispatch)
-- Steps 4-10: NOT STARTED
+- Step 1: DONE - worker.py deployed to all 4 zeros via NFS
+- Step 2: DONE - bob.py dispatches via HTTP, no pico protocol
+- Step 3: DONE - PicoClaw removed from RPi4, zeros run worker.py
+- Step 4: DONE - workers as systemd services, auto-start on boot
+- Step 5: DONE - Distributed Llama 3.1 8B across RPi4-1 (RPC) + RPi4-2 (server)
+- Steps 6-10: NOT STARTED
 
 ## What's Working Today
-- bob.py on RPi4-1: Telegram + Gemini + direct tools (stable with linger)
-- gemini-proxy on RPi4-1: serves workers
-- llama-server on RPi4-2: 1B model for supervisor (underutilized)
-- Morning briefing via cron
+- bob.py on RPi4-1: Telegram + Gemini + direct tools (stable)
+- gemini-proxy on RPi4-1: serves workers on port 8787
+- llama-rpc on RPi4-1: RPC worker contributing 2.3GB/16 layers
+- llama-server on RPi4-2: distributed 8B server on port 8080 (0.8 tok/s)
+- worker.py on p1,p2,p3,p4: HTTP task workers on port 5000
+- Morning briefing via cron at 7am weekdays
 - All tools: calendar, email, weather, traffic
 - GitHub repo: narayan-iyengar/bobthebot-cluster
