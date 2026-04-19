@@ -1,103 +1,96 @@
----
-name: Architecture Goals
-description: Full distributed cluster architecture - Bob v2 with HTTP workers and distributed LLM
-type: project
-originSessionId: c012232c-a22f-41df-adda-157f1d6e9059
----
+# BobTheBot Cluster Architecture
+
 ## Hardware
 - 2x RPi4 4GB (aarch64, Cortex-A72 quad-core)
-- 8x Pi Zero W 512MB (armv6, single-core)
+- 4x Pi Zero W 512MB (armv6, single-core) via ClusterHAT
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    RPi4-1 (Controller)                  │
-│                                                         │
-│  bob.py         - Telegram bot + Gemini + task queue    │
-│  gemini-proxy   - API key proxy for workers (:8787)     │
-│  llama-rpc      - RPC worker for distributed inference  │
-│  tools          - calendar, email, weather, traffic     │
-│  SQLite         - task queue + conversation history     │
-│                                                         │
-│  Dispatches tasks to workers via HTTP                   │
-│  Accepts results, sends to Telegram                     │
-└─────────────┬───────────────────────────────────────────┘
-              │ HTTP dispatch + Gemini proxy
-              │
-    ┌─────────┼─────────┬─────────┬─────────┐
-    │         │         │         │    ...x8 │
-┌───▼───┐┌───▼───┐┌───▼───┐┌───▼───┐       │
-│  p1   ││  p2   ││  p3   ││  p4   │       │
-│Worker ││Worker ││Worker ││Worker │  Zero Ws
-│       ││       ││       ││       │
-│HTTP   ││HTTP   ││HTTP   ││HTTP   │  POST /task
-│:5000  ││:5000  ││:5000  ││:5000  │  -> Gemini
-│       ││       ││       ││       │  -> tools
-│llama  ││llama  ││llama  ││llama  │  -> result
-│rpc*   ││rpc*   ││rpc*   ││rpc*   │  *optional
-└───────┘└───────┘└───────┘└───────┘
+┌─────────────────────────────────────────────────┐
+│              RPi4-1 (Controller)                │
+│                                                 │
+│  bob.py          Telegram bot + Gemini brain    │
+│  gemini-proxy    API key proxy (:8787)          │
+│  llama-rpc       Contributes 1.0GB to Phi-4    │
+│  tools           cal/email/weather/traffic      │
+│  bob.db          SQLite conversation history    │
+└────────┬────────────────────────────────────────┘
+         │ HTTP dispatch (:5000)
+    ┌────┼────┬────┬────┐
+    │    │    │    │    │
+   p1   p2   p3   p4   4x Pi Zero W
+   worker.py on each   HTTP task agents
+   POST /task           call Gemini via proxy
+   GET /health          run tools locally
 
-┌─────────────────────────────────────────────────────────┐
-│                    RPi4-2 (Infra)                       │
-│                                                         │
-│  n8n            - Event-driven workflows (Docker)       │
-│  llama-server   - Main inference server                 │
-│                   Connects to RPi4-1 + Zero RPC workers │
-│                   Serves OpenAI-compatible API (:8080)  │
-│                                                         │
-│  Triggers: email watch, calendar alerts, cron jobs      │
-│  Calls bob.py via webhook when events fire              │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────┐
+│              RPi4-2 (Inference + Infra)          │
+│                                                  │
+│  llama-server    Phi-4 Mini 3.8B (:8080)         │
+│                  1.8GB local + 1.0GB via RPC     │
+│                  1.6 tok/s distributed            │
+│                                                  │
+│  n8n             Event engine (planned)           │
+└──────────────────────────────────────────────────┘
 ```
 
-## Layers
+## How Tasks Flow
 
-### Layer 1: Telegram Interface (RPi4-1)
-- bob.py handles all Telegram I/O
-- Classifies: instant response vs tool call vs async dispatch
-- Approval gates via inline keyboards
-
-### Layer 2: Task Workers (8x Zero Ws)
-- Simple HTTP server (~50 lines Python) on each zero
-- POST /task -> calls Gemini via proxy -> runs tools -> returns JSON
-- Parallel dispatch: bob.py sends HTTP requests to multiple zeros simultaneously
-- No PicoClaw, no pico protocol, no SSH
-
-### Layer 3: Event Engine (RPi4-2)
-- n8n handles event-driven automation
-- Watch email for keywords, check traffic before calendar events
-- Triggers bob.py via webhook: "event happened, here's what to do"
-- Cron-based workflows (morning briefing, daily digest)
-
-### Layer 4: Local LLM (RPi4-1 + RPi4-2 + Zero Ws)
-- llama.cpp distributed inference via RPC
-- RPi4-2 runs llama-server (main process)
-- RPi4-1 runs rpc-server (contributes CPU + RAM)
-- Zero Ws optionally run rpc-server (contribute RAM for model layers)
-- Used for: async tasks where privacy matters or cloud is unavailable
-
-#### Distributed Model Capacity
-- 2x RPi4 only (8GB): 7B Q4_K_M comfortably, ~3-6 tok/s
-- 2x RPi4 + 8 Zero Ws (~12GB usable): 13B Q4_K_M fits
-  - RPi4s handle bulk of compute (fast layers)
-  - Zeros hold extra layers in RAM (slow but adds capacity)
-  - Estimated: ~0.5-1 tok/s (bottlenecked by Zero W compute)
-  - 150 token response = 2-5 minutes. Fine for async dispatch.
+| You ask | What happens | Speed | LLM |
+|---------|-------------|-------|-----|
+| "Hi Bob" | Bob responds directly | instant | Gemini |
+| "Calendar today?" | Bob runs calendar-tool.py | 2-3s | Gemini |
+| "Weather?" | Bob runs weather-tool.py | 1s | Gemini |
+| "Traffic to RTA?" | Bob runs traffic-tool.py | 1s | Gemini |
+| "Research X" | Bob dispatches to a zero worker | 5-15s | Gemini (via proxy) |
+| Supervisor review | Phi-4 Mini on local cluster | ~55s | Local (no cloud) |
+| Privacy-sensitive | Phi-4 Mini on local cluster | ~30-60s | Local (no cloud) |
 
 ## Design Principles
-- No outbound actions without user approval (inline keyboard gates)
-- HTTP everywhere (no PicoClaw, no pico protocol, no SSH dispatch)
-- Adding a worker = copy worker.py + point at proxy
-- Tools as subprocess calls (existing scripts, battle-tested)
-- Gemini for speed-critical tasks, local 7B/13B for privacy/async tasks
-- SQLite for task queue (no Redis, no Celery)
 
-## Build Order
-1. HTTP worker for zeros (worker.py, ~50 lines)
-2. Update bob.py dispatch to HTTP
-3. Kill all PicoClaw on RPi4 (launcher, gateway, auth-proxy)
-4. Install n8n on RPi4-2
-5. Set up distributed 7B across RPi4s via llama.cpp RPC
-6. Add Zero Ws as optional RPC nodes for 13B
-7. Build async task queue with approval gates
+- **Gemini for 95% of tasks**: fast (2-3s), accurate, free tier
+- **Phi-4 Mini for privacy**: email summaries, personal data, offline use
+- **HTTP everywhere**: no PicoClaw, no pico protocol, no SSH dispatch
+- **Adding a worker** = copy worker.py + point at proxy
+- **Tools as subprocess calls**: existing scripts, battle-tested
+- **No outbound actions without approval**: approval gates for calendar writes
+- **SQLite for state**: no Redis, no Celery, right-sized for personal use
+
+## Services
+
+### RPi4-1 (systemd user services)
+| Service | Description |
+|---------|-------------|
+| bob.service | Telegram bot + Gemini orchestrator |
+| gemini-proxy.service | API key proxy for workers on :8787 |
+| llama-rpc.service | RPC worker contributing 1.0GB to distributed Phi-4 |
+
+### RPi4-2 (systemd system services)
+| Service | Description |
+|---------|-------------|
+| llama-server.service | Phi-4 Mini 3.8B distributed server on :8080 |
+
+### Pi Zeros (systemd system services)
+| Service | Description |
+|---------|-------------|
+| worker.service | HTTP task agent on :5000 |
+
+### Cron (RPi4-1)
+| Schedule | Job |
+|----------|-----|
+| 0 7 * * 1-5 | morning-briefing.sh (calendar + email + weather -> Telegram) |
+| */45 * * * * | refresh-tokens.sh (Google Calendar OAuth token refresh via NFS) |
+| 0 4 * * * | clear-sessions.sh (nightly cleanup) |
+
+## Deployment
+
+Workers deployed via NFS filesystem (instant, no SCP):
+```bash
+sudo cp worker.py tools config.json /var/lib/clusterctrl/nfs/p1/home/narayan/
+```
+
+## Future (remaining build plan steps)
+- **n8n on RPi4-2**: Event-driven automation (email watch, pre-event traffic alerts)
+- **Approval gates**: Telegram inline keyboards for approve/reject on calendar writes
+- **Multi-user**: Add family members to Telegram allow list

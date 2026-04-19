@@ -30,7 +30,10 @@ with open("/home/narayan/.bob/gcal-token.json", "w") as f:
     json.dump(t, f, indent=2)
 PYEOF
 
-# Sync to all nodes
-for h in p1 p2 p3 p4; do
-    scp -q ~/.bob/gcal-token.json narayan@$h:~/.bob/gcal-token.json 2>/dev/null
+# Sync to all nodes via NFS (instant, no SSH needed)
+for n in p1 p2 p3 p4; do
+    NFS="/var/lib/clusterctrl/nfs/$n/home/narayan/.bob"
+    if [ -d "$NFS" ]; then
+        cp -f ~/.bob/gcal-token.json "$NFS/gcal-token.json" 2>/dev/null
+    fi
 done
