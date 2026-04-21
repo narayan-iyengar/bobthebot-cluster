@@ -5,6 +5,7 @@ Python orchestrator: Telegram bot + Gemini function calling + existing tools.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -76,7 +77,12 @@ Use the right tool for each request. For simple questions, respond directly with
 - Be concise. Return the answer, not the process.
 - Your name is Bob. Never call yourself anything else.
 - For outbound actions (add/delete calendar events), always confirm with the user first.
-- For research or drafting tasks, use dispatch_worker to send to a cluster worker.
+- For single research/drafting tasks, use dispatch_worker.
+- For multi-part tasks, use dispatch_parallel to fan out across the cluster.
+  Example: "compare 5 restaurants" -> dispatch_parallel with 5 tasks, one per restaurant.
+  Example: "morning briefing" -> dispatch_parallel with calendar, email, weather tasks.
+  Example: "any conflicts for the kids?" -> dispatch_parallel with one task per kid.
+- You have 8 workers. Use them. Parallel is always better than sequential.
 """
 
 # --- Gemini Tool Declarations ---
@@ -125,9 +131,14 @@ TOOLS = {"function_declarations": [
      "parameters": {"type": "object", "properties": {
          "query": {"type": "string"}}, "required": ["query"]}},
     {"name": "dispatch_worker",
-     "description": "Dispatch a task to a cluster worker for research, drafting, or analysis. The worker has web search and tools. Use for tasks that need extended reasoning.",
+     "description": "Dispatch a single task to one cluster worker. Use for a single research, drafting, or analysis task.",
      "parameters": {"type": "object", "properties": {
          "task": {"type": "string", "description": "Task description"}}, "required": ["task"]}},
+    {"name": "dispatch_parallel",
+     "description": "Dispatch multiple tasks to different workers IN PARALLEL. All tasks run simultaneously across the cluster. Use when a request can be split into independent parts. Returns results from all workers. Example: researching 5 restaurants, comparing 4 options, getting schedule for each family member.",
+     "parameters": {"type": "object", "properties": {
+         "tasks": {"type": "array", "items": {"type": "string"}, "description": "List of independent tasks to run in parallel"}},
+      "required": ["tasks"]}},
 ]}
 
 # --- Database ---
@@ -218,6 +229,8 @@ def execute_tool(name, args):
         return duckduckgo_search(args["query"])
     elif name == "dispatch_worker":
         return dispatch_to_worker(args["task"])
+    elif name == "dispatch_parallel":
+        return dispatch_parallel(args["tasks"])
     else:
         return f"Unknown tool: {name}"
 
@@ -245,6 +258,82 @@ def resolve_location(name):
 def shq(s):
     """Shell quote a string."""
     return "'" + s.replace("'", "'\\''") + "'"
+
+def _dispatch_single(worker_url, task, timeout=120):
+    """Send a task to a specific worker. Returns (worker, result) or None."""
+    try:
+        req = urllib.request.Request(f"{worker_url}/health")
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        return None
+
+    try:
+        body = json.dumps({"task": task}).encode()
+        req = urllib.request.Request(
+            f"{worker_url}/task", data=body,
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+            return data.get("result", "[no result]")
+    except Exception as e:
+        log.warning(f"Worker {worker_url} failed: {e}")
+        return None
+
+
+def dispatch_parallel(tasks, timeout=120):
+    """Dispatch multiple tasks to different workers in parallel."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Get healthy workers
+    healthy = []
+    for w in WORKERS:
+        try:
+            req = urllib.request.Request(f"{w}/health")
+            urllib.request.urlopen(req, timeout=2)
+            healthy.append(w)
+        except:
+            continue
+
+    if not healthy:
+        log.warning("No healthy workers for parallel dispatch")
+        return json.dumps(["[no workers available]"] * len(tasks))
+
+    log.info(f"Parallel dispatch: {len(tasks)} tasks across {len(healthy)} workers")
+
+    results = ["[pending]"] * len(tasks)
+
+    def run_task(idx, task, worker_url):
+        body = json.dumps({"task": task}).encode()
+        req = urllib.request.Request(
+            f"{worker_url}/task", data=body,
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read())
+                worker = data.get("worker", "?")
+                log.info(f"Parallel task {idx} done by {worker}")
+                return idx, data.get("result", "[no result]")
+        except Exception as e:
+            return idx, f"[error: {e}]"
+
+    with ThreadPoolExecutor(max_workers=len(healthy)) as pool:
+        futures = []
+        for i, task in enumerate(tasks):
+            worker = healthy[i % len(healthy)]
+            futures.append(pool.submit(run_task, i, task, worker))
+
+        for future in as_completed(futures):
+            idx, result = future.result()
+            results[idx] = result
+
+    # Format results
+    lines = []
+    for i, (task, result) in enumerate(zip(tasks, results)):
+        lines.append(f"Task {i+1}: {task[:50]}...\nResult: {result}\n")
+    return "\n".join(lines)
+
 
 def dispatch_to_worker(task, timeout=120):
     """Dispatch a task to a healthy worker via HTTP."""
@@ -366,6 +455,68 @@ def get_text(parts):
     return "\n".join(texts) if texts else ""
 
 # --- Telegram Handlers ---
+async def handle_photo(update: Update, context):
+    """Handle incoming photos/images."""
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
+
+    chat_id = update.effective_chat.id
+    db = context.bot_data["db"]
+    caption = update.message.caption or "What's in this image? Describe it and take any action if relevant."
+
+    thinking = await update.message.reply_text("Looking at the image...")
+
+    # Download photo (get largest size)
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    img_bytes = await file.download_as_bytearray()
+    img_b64 = base64.b64encode(bytes(img_bytes)).decode()
+
+    # Send to Gemini with image
+    history = [{"role": "user", "parts": [
+        {"text": caption},
+        {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}
+    ]}]
+
+    response = gemini_call(history)
+    if not response:
+        await thinking.edit_text("Sorry, couldn't process the image.")
+        return
+
+    parts = extract_parts(response)
+
+    # Tool calling loop (image might trigger calendar add, etc.)
+    for iteration in range(10):
+        if not has_function_calls(parts):
+            break
+        tool_results = []
+        for part in parts:
+            if "functionCall" not in part:
+                continue
+            fc = part["functionCall"]
+            result = execute_tool(fc["name"], fc.get("args", {}))
+            tool_results.append({"functionResponse": {"name": fc["name"], "response": {"result": result}}})
+        history.append({"role": "model", "parts": parts})
+        history.append({"role": "user", "parts": tool_results})
+        response = gemini_call(history)
+        if not response:
+            break
+        parts = extract_parts(response)
+
+    text = get_text(parts) or "I see the image but have nothing to add."
+    try:
+        if len(text) <= 4096:
+            await thinking.edit_text(text)
+        else:
+            await thinking.edit_text(text[:4096])
+    except Exception as e:
+        log.error(f"Telegram send error: {e}")
+
+    # Save context for follow-ups
+    save_message(db, chat_id, "user", f"[sent image] {caption}")
+    save_message(db, chat_id, "model", text[:300] if text else "")
+
+
 async def handle_message(update: Update, context):
     """Handle incoming Telegram messages."""
     if update.effective_user.id not in ALLOWED_USERS:
@@ -381,8 +532,9 @@ async def handle_message(update: Update, context):
     # Send thinking indicator
     thinking = await update.message.reply_text("Thinking...")
 
-    # Build conversation
-    history = get_history(db, chat_id)
+    # Short sliding window: last 3 exchanges for context (follow-ups like "yes", "add it")
+    # Only keeps user messages + model text responses (not full tool outputs)
+    history = get_history(db, chat_id, limit=6)
     history.append({"role": "user", "parts": [{"text": user_msg}]})
 
     # Call Gemini
@@ -444,9 +596,9 @@ async def handle_message(update: Update, context):
         except:
             pass
 
-    # Save to history
+    # Save short context for follow-ups. Truncate model responses to prevent stale parroting.
     save_message(db, chat_id, "user", user_msg)
-    save_message(db, chat_id, "model", text)
+    save_message(db, chat_id, "model", text[:300] if text else "")
 
 def _get_current_location(max_age_hours=2):
     """Get most recent shared location if within max_age_hours."""
@@ -514,6 +666,7 @@ def main():
     app.bot_data["db"] = db
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(CallbackQueryHandler(handle_callback))
     # Catch-all: silently absorb any unhandled update (edited_message, location, etc.)
     app.add_handler(TypeHandler(Update, lambda u, c: None))
