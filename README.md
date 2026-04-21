@@ -1,6 +1,6 @@
 # BobTheBot Cluster
 
-A multi-agent personal home assistant running on a Raspberry Pi cluster. Bob lives on Telegram and manages your family's calendars, email, weather, traffic, and dispatches research tasks to worker agents.
+A multi-agent personal home assistant running on a 10-node Raspberry Pi cluster. Bob lives on Telegram and manages your family's calendars, email, weather, traffic, and dispatches tasks to 8 worker agents in parallel.
 
 ## What it does
 
@@ -9,8 +9,9 @@ A multi-agent personal home assistant running on a Raspberry Pi cluster. Bob liv
 - **Weather** - Current conditions, 3-day forecast, hourly (via Open-Meteo, free)
 - **Traffic** - Real-time drive times with traffic (via Google Routes API)
 - **Morning briefing** - Automated daily summary at 7am via Telegram
-- **Multi-agent dispatch** - Fan out research/drafting tasks to HTTP worker agents on Pi Zeros
-- **Distributed LLM** - Llama 3.1 8B split across two RPi4s via llama.cpp RPC for local inference
+- **Image processing** - Send photos to Bob, Gemini vision analyzes them
+- **Parallel dispatch** - Fan out tasks across 8 worker agents simultaneously
+- **Distributed LLM** - Phi-4 Mini 3.8B split across two RPi4s via llama.cpp RPC
 
 ## Architecture
 
@@ -18,30 +19,29 @@ A multi-agent personal home assistant running on a Raspberry Pi cluster. Bob liv
 ┌─────────────────────────────────────────────────────┐
 │              RPi4-1 (Controller)                    │
 │                                                     │
-│  bob.py       - Telegram bot + Gemini + task router │
-│  gemini-proxy - API key proxy for workers (:8787)   │
-│  llama-rpc    - RPC worker for distributed LLM      │
-│  tools        - calendar, email, weather, traffic   │
-│                                                     │
-│  Dispatches to workers via HTTP                     │
+│  bob.py         Telegram + Gemini + parallel dispatch│
+│  gemini-proxy   API key proxy for workers (:8787)   │
+│  llama-rpc      Contributes 1.0GB to Phi-4 Mini    │
+│  tools          calendar, email, weather, traffic   │
 └──────────┬──────────────────────────────────────────┘
-           │ HTTP (POST /task, GET /health)
-           │
-  ┌────────┼────────┬────────┬────────┐
-  │        │        │        │        │
-┌─▼──┐ ┌──▼─┐ ┌──▼─┐ ┌──▼─┐      │
-│ p1 │ │ p2 │ │ p3 │ │ p4 │  ... │ Pi Zero W
-│HTTP│ │HTTP│ │HTTP│ │HTTP│      │ workers
-│5000│ │5000│ │5000│ │5000│      │
-└────┘ └────┘ └────┘ └────┘      │
-                                   │
+           │ HTTP dispatch (:5000)
+    ┌──────┼──────┬──────┬──────┐
+    p1    p2    p3    p4           4x Pi Zero W
+    worker.py on each             ClusterHAT v2.5
+
 ┌─────────────────────────────────────────────────────┐
-│              RPi4-2 (Inference + Infra)              │
+│              RPi4-2 (Inference + Workers)            │
 │                                                      │
-│  llama-server  - Distributed 8B inference (:8080)    │
-│                  16 layers local + 16 layers via RPC │
-│  n8n           - Event-driven workflows (planned)    │
-└──────────────────────────────────────────────────────┘
+│  llama-server   Phi-4 Mini 3.8B distributed (:8080) │
+│                 1.8GB local + 1.0GB via RPC          │
+│  port-forward   :5001-5004 -> zeros :5000           │
+└──────────┬──────────────────────────────────────────┘
+           │ port forwarded via iptables
+    ┌──────┼──────┬──────┬──────┐
+    p1    p2    p3    p4           4x Pi Zero W
+    worker.py on each             ClusterHAT v2.6
+
+Total: 2x RPi4 (4GB) + 8x Pi Zero W (512MB) = 10 nodes
 ```
 
 ### How tasks flow
@@ -51,14 +51,17 @@ A multi-agent personal home assistant running on a Raspberry Pi cluster. Bob liv
 | Greetings, simple math | Bob responds directly | instant |
 | Calendar/email query | Bob runs tool on RPi4 | 2-3s |
 | Weather/traffic | Bob runs tool on RPi4 | 1-2s |
-| Research, drafting | Bob dispatches to worker via HTTP | 5-15s |
-| Local LLM (async) | Distributed 8B across RPi4s | ~4 min/response |
+| Single research task | Bob dispatches to 1 worker | 5-15s |
+| Multi-part research | Bob fans out to 8 workers in parallel | 5-15s |
+| Image analysis | Gemini vision | 3-5s |
+| Local LLM (privacy) | Phi-4 Mini distributed, 1.6 tok/s | ~60s |
 
 ## Hardware
 
 - **Raspberry Pi 4** (4GB) x2 - Controller + inference server
-- **ClusterHAT v2.5** - Connects up to 4 Pi Zeros
-- **4-8x Raspberry Pi Zero W** - HTTP worker agents (NFS boot from controller)
+- **ClusterHAT v2.5** - 4 Pi Zeros on RPi4-1
+- **ClusterHAT v2.6** - 4 Pi Zeros on RPi4-2
+- **8x Raspberry Pi Zero W** - HTTP worker agents (NFS boot)
 
 ## Prerequisites
 
@@ -89,21 +92,29 @@ pip3 install python-telegram-bot caldav duckduckgo-search
 # 4. Start Bob
 python3 bob.py
 
-# 5. Deploy workers to Pi Zeros (via NFS)
-# Copy worker.py + tools to each zero's NFS root
-sudo cp worker.py config.json calendar-tool.py email-tool.py \
-       weather-tool.py traffic-tool.py \
-       /var/lib/clusterctrl/nfs/p1/home/youruser/
+# 5. Deploy workers to Pi Zeros (via NFS, instant)
+for n in p1 p2 p3 p4; do
+  sudo cp worker.py config.json calendar-tool.py email-tool.py \
+         weather-tool.py traffic-tool.py \
+         /var/lib/clusterctrl/nfs/$n/home/youruser/
+done
 
 # 6. Start Gemini proxy (for workers)
 python3 gemini-proxy.py 8787
+
+# 7. For second ClusterHAT on RPi4-2, port forward zeros:
+sudo iptables -t nat -A PREROUTING -p tcp --dport 5001 -j DNAT --to 172.19.181.1:5000
+sudo iptables -t nat -A PREROUTING -p tcp --dport 5002 -j DNAT --to 172.19.181.2:5000
+sudo iptables -t nat -A PREROUTING -p tcp --dport 5003 -j DNAT --to 172.19.181.3:5000
+sudo iptables -t nat -A PREROUTING -p tcp --dport 5004 -j DNAT --to 172.19.181.4:5000
+sudo iptables -t nat -A POSTROUTING -j MASQUERADE
 ```
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `bob.py` | Main orchestrator: Telegram + Gemini function calling + tool dispatch |
+| `bob.py` | Main orchestrator: Telegram + Gemini function calling + parallel dispatch |
 | `worker.py` | HTTP worker agent for Pi Zeros (POST /task, GET /health) |
 | `calendar-tool.py` | iCloud + Google Calendar + ICS feed reader/writer |
 | `email-tool.py` | Gmail read-only (inbox, search, read) |
@@ -113,24 +124,24 @@ python3 gemini-proxy.py 8787
 | `gemini-proxy.py` | Gemini API key proxy for workers |
 | `morning-briefing.sh` | Daily briefing (calendar + email + weather -> Telegram) |
 | `gcal-auth.py` | One-time Google OAuth setup |
-| `refresh-tokens.sh` | Cron: refresh Google OAuth tokens every 45 min |
+| `refresh-tokens.sh` | Cron: refresh Google OAuth tokens via NFS |
 
 ## Distributed LLM
 
-Llama 3.1 8B Q4_K_M split across two RPi4s using llama.cpp RPC:
+Phi-4 Mini 3.8B Q4_K_M split across two RPi4s using llama.cpp RPC:
 
 ```bash
-# RPi4-1: RPC worker (contributes CPU + 2.3GB RAM)
+# RPi4-1: RPC worker (contributes CPU + 1.0GB RAM)
 rpc-server --host 0.0.0.0 --port 50052 --threads 2
 
-# RPi4-2: Main server (connects to RPi4-1, loads remaining layers locally)
-llama-server --model Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf \
+# RPi4-2: Main server (1.8GB local + 1.0GB via RPC)
+llama-server --model Phi-4-mini-instruct-Q4_K_M.gguf \
     --host 0.0.0.0 --port 8080 \
     --rpc 192.168.0.42:50052 \
-    --ctx-size 4096 --threads 2 -ngl 16
+    --ctx-size 4096 --threads 2 -ngl 10
 ```
 
-Performance: ~0.8 tok/s. Best for async tasks dispatched in background.
+Performance: 1.6 tok/s. Used for privacy-sensitive tasks and supervisor pre-filtering. Gemini handles 95% of tasks (faster, more accurate, free tier).
 
 ## License
 

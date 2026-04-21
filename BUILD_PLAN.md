@@ -65,8 +65,11 @@
 | Node | Services | Purpose |
 |------|----------|---------|
 | RPi4-1 | bob.py, gemini-proxy, llama-rpc | Controller: Telegram, tools, RPC |
-| RPi4-2 | llama-server (Phi-4 Mini 3.8B) | Distributed local LLM |
-| p1-p4 | worker.py | HTTP task agents |
+| RPi4-2 | llama-server, iptables NAT | Distributed LLM + worker port forwarding |
+| RPi4-1 p1-p4 | worker.py (:5000) | HTTP task agents (direct bridge) |
+| RPi4-2 p1-p4 | worker.py (:5001-5004) | HTTP task agents (port forwarded) |
+
+Total: 10 nodes, 8 workers, parallel dispatch enabled
 
 ## Performance
 
