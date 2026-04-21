@@ -34,6 +34,7 @@ with open(os.path.join(DIR, "config.json")) as f:
 
 GEMINI_KEY = CFG["gemini"]["api_key"]
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
+LOCAL_LLM_URL = "http://rpi4-2-ip:8080/v1/chat/completions"
 BOT_TOKEN = CFG["telegram"]["bot_token"]
 ALLOWED_USERS = [int(uid) for uid in CFG["telegram"].get("allow_from", [CFG["telegram"]["chat_id"]])]
 DB_PATH = os.path.join(DIR, "bob.db")
@@ -79,10 +80,16 @@ Use the right tool for each request. For simple questions, respond directly with
 - For outbound actions (add/delete calendar events), always confirm with the user first.
 - For single research/drafting tasks, use dispatch_worker.
 - For multi-part tasks, use dispatch_parallel to fan out across the cluster.
+- When a worker returns results, present them directly to the user. Do NOT add disclaimers like "I cannot access real-time data" or rewrite the results. The worker already searched the web. Trust its output.
   Example: "compare 5 restaurants" -> dispatch_parallel with 5 tasks, one per restaurant.
   Example: "morning briefing" -> dispatch_parallel with calendar, email, weather tasks.
   Example: "any conflicts for the kids?" -> dispatch_parallel with one task per kid.
-- You have 8 workers. Use them. Parallel is always better than sequential.
+- You have 8 workers. ALWAYS use dispatch_parallel instead of dispatch_worker.
+- Split EVERY research task into multiple sub-tasks. Examples:
+  - "flights to India" -> split by: economy via Europe, economy via Asia, business via Europe, business via Asia
+  - "restaurants near us" -> split by: Italian, Mexican, Japanese, Indian, American
+  - "summer camps" -> split by: basketball, football, music, science, coding
+- NEVER use dispatch_worker for research. ALWAYS dispatch_parallel with at least 2 tasks.
 """
 
 # --- Gemini Tool Declarations ---
@@ -228,7 +235,11 @@ def execute_tool(name, args):
     elif name == "web_search":
         return duckduckgo_search(args["query"])
     elif name == "dispatch_worker":
-        return dispatch_to_worker(args["task"])
+        result = dispatch_to_worker(args["task"])
+        review = supervisor_review(args["task"], result)
+        if "REVISED" in review:
+            return f"WORKER RESEARCH RESULTS (present these to user as-is, do NOT add disclaimers):\n\n{result}\n\n[Supervisor note: {review}]"
+        return f"WORKER RESEARCH RESULTS (present these to user as-is, do NOT add disclaimers):\n\n{result}"
     elif name == "dispatch_parallel":
         return dispatch_parallel(args["tasks"])
     else:
@@ -279,6 +290,30 @@ def _dispatch_single(worker_url, task, timeout=120):
     except Exception as e:
         log.warning(f"Worker {worker_url} failed: {e}")
         return None
+
+
+def supervisor_review(task, output, timeout=90):
+    """Review output using local Phi-4 Mini. Returns APPROVED or REVISED."""
+    body = json.dumps({
+        "model": "Phi-4-mini-instruct",
+        "messages": [{"role": "user", "content":
+            f"Review this output for accuracy. Reply APPROVED if correct, "
+            f"or REVISED with the correction. Be concise.\n\n"
+            f"Task: {task}\nOutput: {output[:500]}"}],
+        "max_tokens": 100,
+        "temperature": 0.1
+    }).encode()
+    req = urllib.request.Request(LOCAL_LLM_URL, data=body,
+                                headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+            result = data["choices"][0]["message"]["content"].strip()
+            log.info(f"Supervisor: {result[:80]}")
+            return result
+    except Exception as e:
+        log.warning(f"Supervisor unavailable: {e}")
+        return "APPROVED"  # fail open
 
 
 def dispatch_parallel(tasks, timeout=120):

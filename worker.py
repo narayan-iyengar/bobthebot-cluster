@@ -36,7 +36,7 @@ Available tools (run via exec):
 - python3 traffic-tool.py lookup "place name"
 
 When a task mentions running a tool, execute it and return the output.
-When a task requires research, use your knowledge to provide a thorough answer.
+When a task requires research, ALWAYS search the web first using DuckDuckGo, then synthesize the results into a thorough answer. Never give generic advice when you can search for real data.
 """
 
 
@@ -77,8 +77,50 @@ def call_gemini(task):
         return f"Error calling Gemini: {e}"
 
 
+def web_search(query, max_results=5):
+    """Search DuckDuckGo via the Gemini proxy host (RPi4-1 has the package installed)."""
+    # Use DuckDuckGo HTML search directly
+    try:
+        url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Linux; ARM) AppleWebKit/537.36"
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode()
+        import re
+        # Parse DuckDuckGo HTML results
+        results = re.findall(
+            r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</td>',
+            html, re.DOTALL
+        )
+        if not results:
+            # Try alternate pattern
+            results = re.findall(
+                r'<a[^>]*class="result__a"[^>]*>(.*?)</a>.*?<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
+                html, re.DOTALL
+            )
+            lines = []
+            for title, snippet in results[:max_results]:
+                title = re.sub(r'<[^>]+>', '', title).strip()
+                snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+                if title:
+                    lines.append(f"- {title}: {snippet[:200]}")
+            return "\n".join(lines) if lines else "No search results found."
+
+        lines = []
+        for href, title, snippet in results[:max_results]:
+            title = re.sub(r'<[^>]+>', '', title).strip()
+            snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+            if title:
+                lines.append(f"- {title}: {snippet[:200]}")
+                lines.append(f"  {href}")
+        return "\n".join(lines) if lines else "No search results found."
+    except Exception as e:
+        return f"Search error: {e}"
+
+
 def process_task(task):
-    """Process a task: if it mentions a tool command, run it. Otherwise ask Gemini."""
+    """Process a task: tool command, web research, or Gemini."""
     # Check if task contains a direct tool command
     tool_prefixes = [
         "python3 calendar-tool", "python3 email-tool",
@@ -86,19 +128,24 @@ def process_task(task):
     ]
     for prefix in tool_prefixes:
         if prefix in task:
-            # Extract the command
             start = task.index(prefix)
-            # Find end of command (next newline or end of string)
             end = task.find("\n", start)
             cmd = task[start:end] if end != -1 else task[start:]
             result = run_tool(cmd.strip())
-            # If task has more context, send tool output to Gemini for formatting
             if len(task) > len(cmd) + 10:
                 return call_gemini(f"Task: {task}\n\nTool output:\n{result}\n\nFormat this into a clear answer.")
             return result
 
-    # No direct tool command, use Gemini
-    return call_gemini(task)
+    # For research tasks: web search first, then synthesize with Gemini
+    # Extract key search terms from the task
+    search_results = web_search(task[:100])
+    return call_gemini(
+        f"Task: {task}\n\n"
+        f"Web search results:\n{search_results}\n\n"
+        f"Using the search results above, provide a detailed, specific answer. "
+        f"Include real data, names, numbers, and links where available. "
+        f"Do NOT give generic advice. Use the search results."
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
